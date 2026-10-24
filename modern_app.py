@@ -61,7 +61,15 @@ DEFAULT_SETTINGS = {
     "anesthesia_types": ["Общая эндотрахеальная", "Спинальная", "Местная", "Проводниковая", "Седация"],
     "doctors": ["Смирнов И. П.", "Соколов Д. А.", "Павлов Р. А."],
     "nurses": ["Кузнецова О. В.", "Морозова Т. С.", "Иванова Е. П."],
+    "allow_custom_anesthesia": False,
+    "allow_custom_doctor": True,
+    "allow_custom_nurse": True,
     "reference_dialog_size": [560, 300],
+}
+REFERENCE_FIELDS = {
+    "anesthesia": ("anesthesia_types", "allow_custom_anesthesia", "Вид наркоза"),
+    "doctor": ("doctors", "allow_custom_doctor", "Врач"),
+    "nurse": ("nurses", "allow_custom_nurse", "Медсестра"),
 }
 
 
@@ -486,6 +494,9 @@ class DataStore:
         for key in ("anesthesia_types", "doctors", "nurses"):
             value = settings.get(key)
             settings[key] = list(value) if isinstance(value, list) else DEFAULT_SETTINGS[key].copy()
+        for _, permission, _ in REFERENCE_FIELDS.values():
+            if not isinstance(settings.get(permission), bool):
+                settings[permission] = DEFAULT_SETTINGS[permission]
         dialog_size = settings.get("reference_dialog_size")
         if not (isinstance(dialog_size, list) and len(dialog_size) == 2 and all(isinstance(value, int) and value > 0 for value in dialog_size)):
             settings["reference_dialog_size"] = DEFAULT_SETTINGS["reference_dialog_size"].copy()
@@ -1418,14 +1429,25 @@ class ReferenceCard(QFrame):
         self.setObjectName("card"); layout = QVBoxLayout(self); layout.setContentsMargins(18, 18, 18, 18); layout.setSpacing(10)
         label = QLabel(title); label.setObjectName("section"); layout.addWidget(label)
         self.listbox = QListWidget(); self.listbox.setMinimumHeight(220); self.listbox.setFocusPolicy(Qt.FocusPolicy.NoFocus); layout.addWidget(self.listbox)
-        actions = QHBoxLayout()
-        for text, slot in ((f"+ Добавить {singular}", self.add), ("Изменить", self.edit), ("Удалить", self.delete)):
-            button = QPushButton(text); button.setObjectName("outline"); button.clicked.connect(slot); actions.addWidget(button)
+        actions = QGridLayout()
+        for index, (text, slot) in enumerate(((f"+ Добавить {singular}", self.add), ("Изменить", self.edit), ("Удалить", self.delete))):
+            button = QPushButton(text); button.setObjectName("outline"); button.clicked.connect(slot)
+            if index == 0: actions.addWidget(button, 0, 0, 1, 2)
+            else: actions.addWidget(button, 1, index - 1)
         layout.addLayout(actions); note = QLabel("Отображается в выпадающем списке"); note.setObjectName("muted"); layout.addWidget(note)
+        field_key = next(field for field, (source, _, _) in REFERENCE_FIELDS.items() if source == key)
+        self.permission_key = REFERENCE_FIELDS[field_key][1]
+        self.custom_input_checkbox = QCheckBox("Разрешить ввод своего значения")
+        self.custom_input_checkbox.setToolTip("Если выключено, в форме пациента можно только выбирать из справочника.")
+        self.custom_input_checkbox.toggled.connect(lambda enabled: self.owner.set_reference_custom_input(field_key, enabled))
+        layout.addWidget(self.custom_input_checkbox)
         self.refresh()
 
     def refresh(self) -> None:
         self.listbox.clear(); self.listbox.addItems(self.owner.store.settings[self.key])
+        self.custom_input_checkbox.blockSignals(True)
+        self.custom_input_checkbox.setChecked(self.owner.store.settings[self.permission_key])
+        self.custom_input_checkbox.blockSignals(False)
 
     def request_value(self, action: str, value: str = "") -> str | None:
         dialog = ReferenceValueDialog(action, self.title, value, self.owner.store.settings["reference_dialog_size"], self)
@@ -1466,6 +1488,7 @@ class JournalWindow(QMainWindow):
         self.page = 0
         self.total = 0
         self.editing_patient_id: int | None = None
+        self._editing_reference_values: dict[str, str] = {}
         self._update_in_progress = False
         self._skip_update_on_close = False
         self._pending_release: ReleaseInfo | None = None
@@ -1709,7 +1732,13 @@ class JournalWindow(QMainWindow):
         def text(label: str, key: str, required=False, placeholder=""):
             lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab); box = QLineEdit(); box.setPlaceholderText(placeholder); form.addWidget(box); self.fields[key] = box; self.input_widgets.append(box)
         def combo(label: str, key: str, values: list[str], required=False):
-            lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab); box = QComboBox(); box.setEditable(True); box.addItems(values); form.addWidget(box); self.fields[key] = box; self.input_widgets.append(box)
+            lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab)
+            box = QComboBox(); box.setEditable(self.store.settings[REFERENCE_FIELDS[key][1]])
+            box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            box.setPlaceholderText("Выберите из списка")
+            box.addItems(values)
+            if not required: box.addItem("")
+            lab.setBuddy(box); form.addWidget(box); self.fields[key] = box; self.input_widgets.append(box)
         text("№ истории", "history", True); text("ФИО", "name", True); text("Возраст", "age", False)
         form.addWidget(QLabel("Операция", objectName="muted")); kinds = QHBoxLayout(); self.kind_group = QButtonGroup(self); self.kind_planned = QRadioButton("Плановая"); self.kind_emergency = QRadioButton("Экстренная"); self.kind_planned.setChecked(True); self.kind_group.addButton(self.kind_planned); self.kind_group.addButton(self.kind_emergency); kinds.addWidget(self.kind_planned); kinds.addWidget(self.kind_emergency); form.addLayout(kinds); self.input_widgets += [self.kind_planned, self.kind_emergency]
         form.addWidget(QLabel("Отделение", objectName="muted")); departments = QVBoxLayout(); self.department_group = QButtonGroup(self)
@@ -1729,7 +1758,9 @@ class JournalWindow(QMainWindow):
         form.addStretch(); scroll.setWidget(inner); outer.addWidget(scroll); return card
 
     def make_settings_page(self) -> QWidget:
-        page = QWidget(); layout = self.page_layout(page); title = QLabel("Настройки"); title.setObjectName("title"); layout.addWidget(title); subtitle = QLabel("Справочники и хранение данных"); subtitle.setObjectName("muted"); layout.addWidget(subtitle)
+        page = QScrollArea(); page.setWidgetResizable(True); page.setFrameShape(QFrame.Shape.NoFrame)
+        page.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        contents = QWidget(); layout = self.page_layout(contents); title = QLabel("Настройки"); title.setObjectName("title"); layout.addWidget(title); subtitle = QLabel("Справочники и хранение данных"); subtitle.setObjectName("muted"); layout.addWidget(subtitle)
         cards = QHBoxLayout(); self.reference_cards = [ReferenceCard(self, "Виды наркоза", "anesthesia_types", "вид"), ReferenceCard(self, "Врачи", "doctors", "врача"), ReferenceCard(self, "Медсестры", "nurses", "медсестру")]
         for card in self.reference_cards: cards.addWidget(card, 1)
         layout.addLayout(cards)
@@ -1742,7 +1773,7 @@ class JournalWindow(QMainWindow):
         self.startup_logging_checkbox.toggled.connect(self.set_startup_logging)
         diagnostics_layout.addWidget(self.startup_logging_checkbox)
         diagnostics_note = QLabel(f"Версия {APP_VERSION}. Лог содержит только время этапов запуска и сохраняется в локальном профиле Windows. После измерения отключите запись."); diagnostics_note.setObjectName("muted"); diagnostics_note.setWordWrap(True); diagnostics_layout.addWidget(diagnostics_note)
-        layout.addWidget(diagnostics); layout.addStretch(); return page
+        layout.addWidget(diagnostics); layout.addStretch(); page.setWidget(contents); return page
 
     def make_report_page(self) -> QWidget:
         page = QWidget(); layout = self.page_layout(page)
@@ -1876,6 +1907,7 @@ class JournalWindow(QMainWindow):
         self.report_status.setText(f"Сформировано {period}. Всего записей: {total}.")
 
     def refresh_patient_state(self) -> None:
+        self.refresh_references()
         available = self.store.conn is not None
         self.titlebar.set_connection_state(available)
         self.alert.setVisible(not available)
@@ -1897,6 +1929,9 @@ class JournalWindow(QMainWindow):
                 continue
             if action == DatabaseAccessDialog.CHOOSE_ANOTHER:
                 self.choose_database_root()
+                self.refresh_patient_state()
+                self.update_connection_status()
+                return
             break
         try:
             if self.store.conn:
@@ -1975,6 +2010,14 @@ class JournalWindow(QMainWindow):
         if missing:
             self.show_validation_error("Не заполнены поля", "Обязательные поля: " + ", ".join(missing))
             return False
+        for key, (source, permission, label) in REFERENCE_FIELDS.items():
+            value = data[key]
+            if self.store.settings[permission] or not value or value in self.store.settings[source]:
+                continue
+            if self.editing_patient_id is not None and value == self._editing_reference_values.get(key):
+                continue
+            self.show_validation_error(label, "Выберите значение из справочника в настройках. Ввод своего значения отключён.")
+            return False
         try: datetime.strptime(data["date"], "%Y-%m-%d")
         except ValueError:
             self.show_validation_error("Дата операции", "Используйте формат ГГГГ-ММ-ДД.")
@@ -2009,15 +2052,24 @@ class JournalWindow(QMainWindow):
         patient_id = self.table.selectedItems()[0].data(Qt.ItemDataRole.UserRole); row = self.store.conn.execute("SELECT * FROM patients WHERE id=?",(patient_id,)).fetchone()
         if not row: return
         self.editing_patient_id = int(row["id"])
+        self._editing_reference_values = {
+            key: str(row[column] or "").strip()
+            for key, column in (("anesthesia", "anesthesia_type"), ("doctor", "doctor"), ("nurse", "nurse"))
+        }
         mapping = {"history":"history_number","name":"full_name","age":"age","date":"operation_date","diagnosis":"diagnosis","anesthesia":"anesthesia_type","start":"anesthesia_start","end":"anesthesia_end","procedure":"procedure_name","doctor":"doctor","nurse":"nurse"}
         for key,column in mapping.items():
-            target=self.fields[key]; value=str(row[column] or ""); target.setCurrentText(value) if isinstance(target,QComboBox) else target.setText(value)
+            value = str(row[column] or "")
+            if key in REFERENCE_FIELDS: self.set_reference_value(key, value)
+            else: self.fields[key].setText(value)
         self.set_department(str(row["department"] or ""))
         self.kind_planned.setChecked(row["operation_kind"] == "Плановая"); self.kind_emergency.setChecked(row["operation_kind"] == "Экстренная"); self.form_title.setText("Редактирование пациента"); self.save_button.setText("Сохранить изменения"); self.cancel_button.show(); self.delete_patient_button.show(); self.update_duration()
 
     def cancel_edit(self) -> None:
         self.editing_patient_id=None
-        for key, target in self.fields.items(): target.setCurrentText("") if isinstance(target,QComboBox) else target.setText("")
+        self._editing_reference_values.clear()
+        for key, target in self.fields.items():
+            if key in REFERENCE_FIELDS: self.set_reference_value(key, "")
+            else: target.setText("")
         self.set_department("")
         self.fields["date"].setText(date.today().isoformat()); self.kind_planned.setChecked(True); self.form_title.setText("Быстрое добавление"); self.save_button.setText("Добавить пациента"); self.cancel_button.hide(); self.delete_patient_button.hide(); self.update_duration()
 
@@ -2047,10 +2099,43 @@ class JournalWindow(QMainWindow):
         self.cancel_edit()
         self.load_patients()
 
+    def set_reference_value(self, key: str, value: str) -> None:
+        source, permission, _ = REFERENCE_FIELDS[key]
+        box = self.fields[key]
+        editable = self.store.settings[permission]
+        box.clear()
+        box.setEditable(editable)
+        box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        box.setToolTip("Можно выбрать из списка или ввести своё значение." if editable else "Только выбор из справочника в настройках.")
+        box.addItems(self.store.settings[source])
+        if key != "anesthesia": box.addItem("")
+        # Старое значение доступно только в своей записи и не попадает в справочник.
+        historical = self.editing_patient_id is not None and value and value == self._editing_reference_values.get(key)
+        if historical and box.findText(value) < 0:
+            box.addItem(value)
+            box.setItemData(box.count() - 1, "Сохранённое значение этой записи; отсутствует в справочнике.", Qt.ItemDataRole.ToolTipRole)
+        box.setCurrentIndex(-1)
+        if value:
+            if editable: box.setEditText(value)
+            else: box.setCurrentIndex(box.findText(value))
+
     def refresh_references(self) -> None:
         for card in self.reference_cards: card.refresh()
-        for key, source in (("anesthesia", "anesthesia_types"),("doctor","doctors"),("nurse","nurses")):
-            box = self.fields[key]; value=box.currentText(); box.clear(); box.addItems(self.store.settings[source]); box.setCurrentText(value)
+        for key in REFERENCE_FIELDS:
+            self.set_reference_value(key, self.fields[key].currentText())
+
+    def set_reference_custom_input(self, key: str, enabled: bool) -> None:
+        permission = REFERENCE_FIELDS[key][1]
+        previous = self.store.settings[permission]
+        self.store.settings[permission] = enabled
+        try:
+            self.store.save_settings()
+        except OSError:
+            self.store.settings[permission] = previous
+            for card in self.reference_cards: card.refresh()
+            self.show_validation_error("Не удалось сохранить настройку", "Проверьте доступ к общей папке журнала. Прежний режим ввода сохранён.")
+            return
+        self.refresh_references()
 
     def persist_references(self) -> None: self.store.save_settings(); self.refresh_references()
     def choose_database_root(self) -> None:
@@ -2126,6 +2211,7 @@ class JournalWindow(QMainWindow):
         except (OSError, sqlite3.Error):
             pass
         self.path_field.setText(str(root))
+        self.cancel_edit()
         self.refresh_patient_state()
         self.update_connection_status()
 
