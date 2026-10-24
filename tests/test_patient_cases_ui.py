@@ -58,6 +58,7 @@ class PatientCasesUiTests(unittest.TestCase):
 
         store = DataStore.__new__(DataStore)
         store.settings = DataStore.validated_settings({}, root)
+        store.settings["anesthesia_types"] = ["Общая"]
         store.conn = sqlite3.connect(":memory:")
         store.conn.row_factory = sqlite3.Row
         store.connected_root = root
