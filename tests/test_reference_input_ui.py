@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import sqlite3
@@ -319,13 +320,14 @@ class ReferenceInputUiTests(unittest.TestCase):
 
         other_root = self.root / "other-journal"
         (other_root / "data").mkdir(parents=True)
-        with sqlite3.connect(other_root / "data" / "journal.db") as connection:
+        with closing(sqlite3.connect(other_root / "data" / "journal.db")) as connection:
             initialize_schema(connection)
             connection.execute(
                 """INSERT INTO patients
                    (history_number, full_name, operation_kind, operation_date, anesthesia_type)
                    VALUES ('other', 'Пациент новой базы', 'Плановая', '2026-01-02', 'Новый наркоз')"""
             )
+            connection.commit()
         other_settings = DataStore.validated_settings(
             {
                 "anesthesia_types": ["Новый наркоз"],
