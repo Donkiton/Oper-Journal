@@ -19,13 +19,13 @@ from pathlib import Path
 
 PROCESS_STARTED_AT = time.perf_counter()
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QRectF, QSize, QThread, QTime, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainterPath, QPixmap, QRegion
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QParallelAnimationGroup, QPoint, QPropertyAnimation, QRect, QRectF, QSize, QThread, QTime, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QRegion
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QGraphicsDropShadowEffect, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListView, QListWidget,
     QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSplashScreen,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
 from app_version import APP_VERSION
@@ -123,6 +123,10 @@ QLabel#dialogEyebrow { color: #6e6e73; font-size: 11px; font-weight: 600; }
 QLabel#dialogTitle { color: #1d1d1f; font-size: 20px; font-weight: 700; }
 QLabel#dialogWarning { color: #d1544d; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; }
 QComboBox::drop-down { border: 0; width: 25px; }
+QComboBox { combobox-popup: 0; }
+QFrame#referencePopup { background: transparent; border: 0; }
+QListView#referenceOptions { background: #efefef; border: 1px solid #d2d2d7; border-radius: 10px; padding: 5px; font-size: 13px; outline: 0; }
+QWidget#referenceOptionsViewport { background: transparent; }
 QTableWidget { background: white; border: none; gridline-color: #f0f0f2; selection-background-color: #e8f1ff; selection-color: #1d1d1f; font-size: 12px; }
 QHeaderView::section { background: #fbfbfc; border-top: 0; border-left: 0; border-right: 1px solid #c2c6ce; border-bottom: 1px solid #d5d8de; color: #535761; font-size: 11px; font-weight: 600; padding: 11px 8px; }
 QHeaderView::section:hover { background: #f1f4f8; border-right: 2px solid #8f96a3; color: #1d1d1f; }
@@ -319,6 +323,144 @@ class ContainedPixmapLabel(QLabel):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._refresh_pixmap()
+
+
+class ReferenceOptionDelegate(QStyledItemDelegate):
+    """Строки справочника с мягким выделением и отметкой выбранного значения."""
+
+    def __init__(self, combo: "ReferenceComboBox") -> None:
+        super().__init__(combo)
+        self.combo = combo
+
+    def sizeHint(self, option, index) -> QSize:
+        size = super().sizeHint(option, index)
+        size.setHeight(max(34, option.fontMetrics.height() + 14))
+        size.setWidth(size.width() + 28)
+        return size
+
+    def helpEvent(self, event, view, option, index) -> bool:
+        if event.type() == QEvent.Type.ToolTip and not index.data(Qt.ItemDataRole.ToolTipRole):
+            styled = QStyleOptionViewItem(option)
+            self.initStyleOption(styled, index)
+            if styled.fontMetrics.horizontalAdvance(styled.text) > styled.rect.width() - 38:
+                QToolTip.showText(event.globalPos(), styled.text, view, styled.rect)
+                return True
+        return super().helpEvent(event, view, option, index)
+
+    def paint(self, painter, option, index) -> None:
+        styled = QStyleOptionViewItem(option)
+        self.initStyleOption(styled, index)
+        chosen = index == self.combo.model().index(
+            self.combo.currentIndex(), self.combo.modelColumn(), self.combo.rootModelIndex()
+        )
+        active = bool(styled.state & (QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_MouseOver))
+        enabled = bool(styled.state & QStyle.StateFlag.State_Enabled)
+        color = QColor("#075bac" if chosen else "#1d1d1f") if enabled else QColor("#8e8e93")
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if chosen or active:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#e8f1ff" if chosen else "#e1e4e8"))
+            painter.drawRoundedRect(QRectF(styled.rect), 6, 6)
+        painter.setFont(styled.font)
+        painter.setPen(color)
+        text_rect = styled.rect.adjusted(9, 0, -29, 0)
+        text = styled.fontMetrics.elidedText(styled.text, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        if chosen:
+            right, middle = styled.rect.right(), styled.rect.center().y()
+            tick = QPainterPath()
+            tick.moveTo(right - 19, middle)
+            tick.lineTo(right - 16, middle + 3)
+            tick.lineTo(right - 10, middle - 3)
+            painter.setPen(QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(tick)
+        painter.restore()
+
+
+class ReferenceComboBox(QComboBox):
+    """Стандартный выбор Qt с единым оформлением списка в обоих режимах ввода."""
+
+    SHADOW_MARGIN = 12
+    POPUP_GAP = 4
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        view = QListView()
+        view.setObjectName("referenceOptions")
+        view.viewport().setObjectName("referenceOptionsViewport")
+        view.setMouseTracking(True)
+        view.setUniformItemSizes(True)
+        self.setView(view)
+        self.setItemDelegate(ReferenceOptionDelegate(self))
+        self.setMaxVisibleItems(8)
+
+        self._popup = view.window()
+        self._popup.setObjectName("referencePopup")
+        self._popup.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self._popup.setWindowFlag(Qt.WindowType.NoDropShadowWindowHint)
+        self._popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._popup.layout().setContentsMargins(*([self.SHADOW_MARGIN] * 4))
+        self._popup.installEventFilter(self)
+        shadow = QGraphicsDropShadowEffect(view)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(26, 26, 34, 36))
+        view.setGraphicsEffect(shadow)
+
+        self._popup_animation = QParallelAnimationGroup(self)
+        for name in (b"pos", b"windowOpacity"):
+            animation = QPropertyAnimation(self._popup, name, self._popup_animation)
+            animation.setDuration(140)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._popup_animation.addAnimation(animation)
+
+    def showPopup(self) -> None:
+        if not self.count() or self._popup.isVisible():
+            return
+        animate = QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateCombo)
+        # Заменяем встроенное разворачивание Qt одним коротким появлением панели.
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
+        self._popup.setUpdatesEnabled(False)
+        try:
+            super().showPopup()
+        finally:
+            QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, animate)
+        margin = self.SHADOW_MARGIN
+        screen = self.screen().availableGeometry()
+        origin = self.mapToGlobal(QPoint(0, 0))
+        row_height = self.view().sizeHintForRow(0)
+        height = min(self.count(), self.maxVisibleItems()) * row_height + 12 + 2 * margin
+        width = min(self.width() + 2 * margin, screen.width())
+        below = origin.y() + self.height() + self.POPUP_GAP - margin
+        above = origin.y() - self.POPUP_GAP + margin
+        room_below = screen.bottom() + 1 - below
+        room_above = above - screen.top()
+        open_below = height <= room_below or room_below >= room_above
+        height = min(height, max(1, room_below if open_below else room_above))
+        x = max(screen.left(), min(origin.x() - margin, screen.right() + 1 - width))
+        y = below if open_below else above - height
+        target = QPoint(x, max(screen.top(), min(y, screen.bottom() + 1 - height)))
+        self._popup.setGeometry(QRect(target, QSize(width, height)))
+        self._popup.layout().activate()
+        self.view().scrollTo(self.view().currentIndex())
+        if animate:
+            self._popup.setWindowOpacity(0)
+            for index, start, end in (
+                (0, target + QPoint(0, -5 if open_below else 5), target),
+                (1, 0.0, 1.0),
+            ):
+                animation = self._popup_animation.animationAt(index)
+                animation.setStartValue(start)
+                animation.setEndValue(end)
+            self._popup_animation.start()
+        self._popup.setUpdatesEnabled(True)
+
+    def eventFilter(self, source, event) -> bool:
+        if source is self._popup and event.type() == QEvent.Type.Hide:
+            self._popup_animation.stop()
+            self._popup.setWindowOpacity(1)
+        return super().eventFilter(source, event)
 
 
 class TitleBar(QFrame):
@@ -1733,7 +1875,7 @@ class JournalWindow(QMainWindow):
             lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab); box = QLineEdit(); box.setPlaceholderText(placeholder); form.addWidget(box); self.fields[key] = box; self.input_widgets.append(box)
         def combo(label: str, key: str, values: list[str], required=False):
             lab = QLabel(label + (" *" if required else "")); lab.setObjectName("muted"); form.addWidget(lab)
-            box = QComboBox(); box.setEditable(self.store.settings[REFERENCE_FIELDS[key][1]])
+            box = ReferenceComboBox(); box.setEditable(self.store.settings[REFERENCE_FIELDS[key][1]])
             box.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
             box.setPlaceholderText("Выберите из списка")
             box.addItems(values)
